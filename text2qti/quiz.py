@@ -31,16 +31,24 @@ from .markdown import Image, Markdown
 
 
 
-# regex patterns for parsing quiz
+# regex patterns for parsing quiz content
 start_patterns = {
     'question': r'\d+\.',
-    'correct_choice': r'\*[a-zA-Z]\)',
-    'incorrect_choice': r'[a-zA-Z]\)',
+    'mctf_correct_choice': r'\*[a-zA-Z]\)',
+    'mctf_incorrect_choice': r'[a-zA-Z]\)',
+    'multans_correct_choice': r'\[\*\]',
+    'multans_incorrect_choice': r'\[ ?\]',
+    'shortans_correct_choice': r'\*',
     'feedback': r'\.\.\.',
     'correct_feedback': r'\+',
     'incorrect_feedback': r'\-',
     'essay': r'___+',
+    'upload': r'\^\^\^+',
     'numerical': r'=',
+    'question_title': r'[Tt]itle:',
+    'question_points': r'[Pp]oints:',
+    'text_title': r'[Tt]ext [Tt]itle:',
+    'text': r'[Tt]ext:',
     'quiz_title': r'[Qq]uiz [Tt]itle:',
     'quiz_description': r'[Qq]uiz [Dd]escription:',
     'start_group': r'GROUP',
@@ -50,7 +58,18 @@ start_patterns = {
     'start_code': r'```+\s*\S.*',
     'end_code': r'```+',
 }
-no_content = set(['essay', 'start_group', 'end_group', 'start_code', 'end_code'])
+# comments are currently handled separately from content
+comment_patterns = {
+    'start_multiline_comment': r'COMMENT',
+    'end_multiline_comment': r'END_COMMENT',
+    'line_comment': r'%',
+}
+# whether regex needs to check after pattern for content on the same line
+no_content = set(['essay', 'upload', 'start_group', 'end_group', 'start_code', 'end_code'])
+# whether parser needs to check for multi-line content
+multi_line = set([x for x in start_patterns
+                  if x not in no_content and not any(y in x for y in ('pick', 'points', 'numerical', 'shortans'))])
+# whether parser needs to check for multi-paragraph content
 multi_para = set([x for x in start_patterns
                   if x not in no_content and not any(y in x for y in ('title', 'pick', 'points', 'numerical'))])
 start_re = re.compile('|'.join(r'(?P<{0}>{1}[ \t]+(?=\S))'.format(name, pattern)
@@ -69,6 +88,46 @@ int_re = re.compile('(?:0|[+-]?[1-9](?:[0-9]+|_[0-9]+)*)$')
 
 
 
+class TextRegion(object):
+    '''
+    A text region between questions.
+    '''
+    def __init__(self, *, index: int, md: Markdown):
+        self.title_raw: Optional[str] = None
+        self.title_xml = ''
+        self.text_raw: Optional[str] = None
+        self.text_html_xml = ''
+        self.md = md
+        self._index = index
+
+    def _set_id(self):
+        h = hashlib.blake2b()
+        h.update(f'{self._index}'.encode('utf8'))
+        h.update(h.digest())
+        h.update(self.title_xml.encode('utf8'))
+        h.update(h.digest())
+        h.update(self.text_html_xml.encode('utf8'))
+        self.id = h.hexdigest()[:64]
+
+    def set_title(self, text: str):
+        if self.title_raw is not None:
+            raise Text2qtiError('Text title has already been set')
+        if self.text_raw is not None:
+            raise Text2qtiError('Must set text title before text itself')
+        self.title_raw = text
+        self.title_xml = self.md.xml_escape(text)
+        self._set_id()
+
+    def set_text(self, text: str):
+        if self.text_raw is not None:
+            raise Text2qtiError('Text has already been set')
+        self.text_raw = text
+        self.text_html_xml = self.md.md_to_html_xml(text)
+        self._set_id()
+
+
+
+
 class Choice(object):
     '''
     A choice for a question plus optional feedback.
@@ -77,15 +136,23 @@ class Choice(object):
     The presence of feedback does not affect the id.
     '''
     def __init__(self, text: str, *,
-                 correct: bool, question_hash_digest: bytes, md: Markdown):
+                 correct: bool, shortans=False,
+                 question_hash_digest: bytes, md: Markdown):
         self.choice_raw = text
-        self.choice_html_xml = md.md_to_html_xml(text)
+        if shortans:
+            self.choice_xml = md.xml_escape(text)
+        else:
+            self.choice_html_xml = md.md_to_html_xml(text)
         self.correct = correct
+        self.shortans = shortans
         self.feedback_raw: Optional[str] = None
         self.feedback_html_xml: Optional[str] = None
         # ID is based on hash of choice XML as well as question XML.  This
         # gives different IDs for identical choices in different questions.
-        self.id = hashlib.blake2b(self.choice_html_xml.encode('utf8'), key=question_hash_digest).hexdigest()[:64]
+        if shortans:
+            self.id = hashlib.blake2b(self.choice_xml.encode('utf8'), key=question_hash_digest).hexdigest()[:64]
+        else:
+            self.id = hashlib.blake2b(self.choice_html_xml.encode('utf8'), key=question_hash_digest).hexdigest()[:64]
         self.md = md
 
     def append_feedback(self, text: str):
@@ -100,14 +167,18 @@ class Question(object):
     A question, along with a list of possible choices and optional feedback of
     various types.
     '''
-    def __init__(self, text: str, *, md: Markdown):
+    def __init__(self, text: str, *, title: Optional[str], points: Optional[str], md: Markdown):
         # Question type is set once it is known.  For true/false or multiple
         # choice, this is done during .finalize(), once all choices are
         # available.  For essay, this is done as soon as essay response is
         # specified.
         self.type: Optional[str] = None
-        self.title_raw: Optional[str] = None
-        self.title_xml = 'Question'
+        if title is None:
+            self.title_raw: Optional[str] = None
+            self.title_xml = 'Question'
+        else:
+            self.title_raw: Optional[str] = title
+            self.title_xml = md.xml_escape(title)
         self.question_raw = text
         self.question_html_xml = md.md_to_html_xml(text)
         self.choices: List[Choice] = []
@@ -117,10 +188,27 @@ class Question(object):
         self._choice_set: Set[str] = set()
         self.numerical_min: Optional[Union[int, float]] = None
         self.numerical_min_html_xml: Optional[str] = None
+        self.numerical_exact: Optional[Union[int, float]] = None
+        self.numerical_exact_html_xml: Optional[str] = None
         self.numerical_max: Optional[Union[int, float]] = None
         self.numerical_max_html_xml: Optional[str] = None
         self.correct_choices = 0
-        self.points_possible = 1
+        if points is None:
+            self.points_possible_raw: Optional[str] = None
+            self.points_possible: Union[int, float] = 1
+        else:
+            self.points_possible_raw: Optional[str] = points
+            try:
+                points_num = float(points)
+            except ValueError:
+                raise Text2qtiError(f'Invalid points value "{points}"; need positive integer or half-integer')
+            if points_num <= 0:
+                raise Text2qtiError(f'Invalid points value "{points}"; need positive integer or half-integer')
+            if points_num.is_integer():
+                points_num = int(points)
+            elif abs(points_num-round(points_num)) != 0.5:
+                raise Text2qtiError(f'Invalid points value "{points}"; need positive integer or half-integer')
+            self.points_possible: Union[int, float] = points_num
         self.feedback_raw: Optional[str] = None
         self.feedback_html_xml: Optional[str] = None
         self.correct_feedback_raw: Optional[str] = None
@@ -133,31 +221,8 @@ class Question(object):
         self.md = md
 
 
-    _no_feedback_question_types = set(['essay_question'])
-
-    def append_correct_choice(self, text: str):
-        if self.type is not None:
-            raise Text2qtiError(f'Question type "{self.type}" does not support choices')
-        choice = Choice(text, correct=True, question_hash_digest=self.hash_digest, md=self.md)
-        if choice.choice_html_xml in self._choice_set:
-            raise Text2qtiError('Duplicate choice for question')
-        self._choice_set.add(choice.choice_html_xml)
-        self.choices.append(choice)
-        self.correct_choices += 1
-
-    def append_incorrect_choice(self, text: str):
-        if self.type is not None:
-            raise Text2qtiError(f'Question type "{self.type}" does not support choices')
-        choice = Choice(text, correct=False, question_hash_digest=self.hash_digest, md=self.md)
-        if choice.choice_html_xml in self._choice_set:
-            raise Text2qtiError('Duplicate choice for question')
-        self._choice_set.add(choice.choice_html_xml)
-        self.choices.append(choice)
-
     def append_feedback(self, text: str):
-        if self.type is not None:
-            if self.type in self._no_feedback_question_types:
-                raise Text2qtiError(f'Question type "{self.type}" does not support feedback')
+        if self.type in ('essay_question', 'file_upload_question', 'numerical_question'):
             raise Text2qtiError('Question feedback must immediately follow the question')
         if not self.choices:
             if self.feedback_raw is not None:
@@ -168,28 +233,84 @@ class Question(object):
             self.choices[-1].append_feedback(text)
 
     def append_correct_feedback(self, text: str):
-        if self.type is not None:
-            if self.type in self._no_feedback_question_types:
-                raise Text2qtiError(f'Question type "{self.type}" does not support feedback')
-            raise Text2qtiError('Question feedback must immediately follow the question')
-        if self.choices:
-            raise Text2qtiError('Correct feedback can only be specified for questions, not choices')
+        if self.type in ('essay_question', 'file_upload_question'):
+            raise Text2qtiError(f'Question type "{self.type}" does not support correct feedback')
+        if self.choices or self.type == 'numerical_question':
+            raise Text2qtiError('Correct feedback can only be specified for questions')
         if self.correct_feedback_raw is not None:
             raise Text2qtiError('Feedback can only be specified once')
         self.correct_feedback_raw = text
         self.correct_feedback_html_xml = self.md.md_to_html_xml(text)
 
     def append_incorrect_feedback(self, text: str):
-        if self.type is not None:
-            if self.type in self._no_feedback_question_types:
-                raise Text2qtiError(f'Question type "{self.type}" does not support feedback')
-            raise Text2qtiError('Question feedback must immediately follow the question')
-        if self.choices:
-            raise Text2qtiError('Incorrect feedback can only be specified for questions, not choices')
+        if self.type in ('essay_question', 'file_upload_question'):
+            raise Text2qtiError(f'Question type "{self.type}" does not support incorrect feedback')
+        if self.choices or self.type == 'numerical_question':
+            raise Text2qtiError('Incorrect feedback can only be specified for questions')
         if self.incorrect_feedback_raw is not None:
             raise Text2qtiError('Feedback can only be specified once')
         self.incorrect_feedback_raw = text
         self.incorrect_feedback_html_xml = self.md.md_to_html_xml(text)
+
+    def append_mctf_correct_choice(self, text: str):
+        if self.type is not None:
+            raise Text2qtiError(f'Question type "{self.type}" does not support multiple choice')
+        choice = Choice(text, correct=True, question_hash_digest=self.hash_digest, md=self.md)
+        if choice.choice_html_xml in self._choice_set:
+            raise Text2qtiError('Duplicate choice for question')
+        self._choice_set.add(choice.choice_html_xml)
+        self.choices.append(choice)
+        self.correct_choices += 1
+
+    def append_mctf_incorrect_choice(self, text: str):
+        if self.type is not None:
+            raise Text2qtiError(f'Question type "{self.type}" does not support multiple choice')
+        choice = Choice(text, correct=False, question_hash_digest=self.hash_digest, md=self.md)
+        if choice.choice_html_xml in self._choice_set:
+            raise Text2qtiError('Duplicate choice for question')
+        self._choice_set.add(choice.choice_html_xml)
+        self.choices.append(choice)
+
+    def append_shortans_correct_choice(self, text: str):
+        if self.type is None:
+            self.type = 'short_answer_question'
+            if self.choices:
+                raise Text2qtiError(f'Question type "{self.type}" is not compatible with existing choices')
+        elif self.type != 'short_answer_question':
+            raise Text2qtiError(f'Question type "{self.type}" does not support short answer')
+        choice = Choice(text, correct=True, shortans=True, question_hash_digest=self.hash_digest, md=self.md)
+        if choice.choice_xml in self._choice_set:
+            raise Text2qtiError('Duplicate choice for question')
+        self._choice_set.add(choice.choice_xml)
+        self.choices.append(choice)
+        self.correct_choices += 1
+
+    def append_multans_correct_choice(self, text: str):
+        if self.type is None:
+            self.type = 'multiple_answers_question'
+            if self.choices:
+                raise Text2qtiError(f'Question type "{self.type}" is not compatible with existing choices')
+        elif self.type != 'multiple_answers_question':
+            raise Text2qtiError(f'Question type "{self.type}" does not support multiple answers')
+        choice = Choice(text, correct=True, question_hash_digest=self.hash_digest, md=self.md)
+        if choice.choice_html_xml in self._choice_set:
+            raise Text2qtiError('Duplicate choice for question')
+        self._choice_set.add(choice.choice_html_xml)
+        self.choices.append(choice)
+        self.correct_choices += 1
+
+    def append_multans_incorrect_choice(self, text: str):
+        if self.type is None:
+            self.type = 'multiple_answers_question'
+            if self.choices:
+                raise Text2qtiError(f'Question type "{self.type}" is not compatible with existing choices')
+        elif self.type != 'multiple_answers_question':
+            raise Text2qtiError(f'Question type "{self.type}" does not support multiple answers')
+        choice = Choice(text, correct=False, question_hash_digest=self.hash_digest, md=self.md)
+        if choice.choice_html_xml in self._choice_set:
+            raise Text2qtiError('Duplicate choice for question')
+        self._choice_set.add(choice.choice_html_xml)
+        self.choices.append(choice)
 
     def append_essay(self, text: str):
         if text:
@@ -204,8 +325,24 @@ class Question(object):
         self.type = 'essay_question'
         if self.choices:
             raise Text2qtiError(f'Question type "{self.type}" is not compatible with existing choices')
-        if any(x is not None for x in (self.feedback_raw, self.correct_feedback_raw, self.incorrect_feedback_raw)):
-            raise Text2qtiError(f'Question type "{self.type}" does not support feedback')
+        if any(x is not None for x in (self.correct_feedback_raw, self.incorrect_feedback_raw)):
+            raise Text2qtiError(f'Question type "{self.type}" does not support correct/incorrect feedback')
+
+    def append_upload(self, text: str):
+        if text:
+            # The upload response indicator consumes its entire line, leaving
+            # the empty string; `text` just gives all append functions
+            # the same form.
+            raise ValueError
+        if self.type is not None:
+            if self.type == 'file_upload_question':
+                raise Text2qtiError(f'Cannot specify upload response multiple times')
+            raise Text2qtiError(f'Question type "{self.type}" does not support upload response')
+        self.type = 'file_upload_question'
+        if self.choices:
+            raise Text2qtiError(f'Question type "{self.type}" is not compatible with existing choices')
+        if any(x is not None for x in (self.correct_feedback_raw, self.incorrect_feedback_raw)):
+            raise Text2qtiError(f'Question type "{self.type}" does not support correct/incorrect feedback')
 
     def append_numerical(self, text: str):
         if self.type is not None:
@@ -226,6 +363,14 @@ class Question(object):
                 raise Text2qtiError('Invalid numerical response; need "[<min>, <max>]" or "<number> +- <margin>" or "<integer>"')
             if min > max:
                 raise Text2qtiError('Invalid numerical response; need "[<min>, <max>]" with min < max')
+            self.numerical_min = min
+            self.numerical_max = max
+            if min.is_integer() and max.is_integer():
+                self.numerical_min_html_xml = f'{min}'
+                self.numerical_max_html_xml = f'{max}'
+            else:
+                self.numerical_min_html_xml = f'{min:.4f}'
+                self.numerical_max_html_xml = f'{max:.4f}'
         elif '+-' in text:
             num, margin = text.split('+-', 1)
             if margin.endswith('%'):
@@ -246,16 +391,30 @@ class Question(object):
             else:
                 min = num - margin
                 max = num + margin
+            self.numerical_min = min
+            self.numerical_exact = num
+            self.numerical_max = max
+            if min.is_integer() and num.is_integer() and max.is_integer():
+                self.numerical_min_html_xml = f'{min}'
+                self.numerical_exact_html_xml = f'{num}'
+                self.numerical_max_html_xml = f'{max}'
+            else:
+                self.numerical_min_html_xml = f'{min:.4f}'
+                self.numerical_exact_html_xml = f'{num:.4f}'
+                self.numerical_max_html_xml = f'{max:.4f}'
         elif int_re.match(text):
-            min = max = int(text)
+            num = int(text)
+            min = max = num
+            self.numerical_min = min
+            self.numerical_exact = num
+            self.numerical_max = max
+            self.numerical_min_html_xml = f'{min}'
+            self.numerical_exact_html_xml = f'{num}'
+            self.numerical_max_html_xml = f'{max}'
         else:
             raise Text2qtiError('Invalid numerical response; need "[<min>, <max>]" or "<number> +- <margin>" or "<integer>"')
         if abs(min) < 1e-4 or abs(max) < 1e-4:
             raise Text2qtiError('Invalid numerical response; all acceptable values must have a magnitude >= 0.0001')
-        self.numerical_min = min
-        self.numerical_min_html_xml = f'{min:.4f}'
-        self.numerical_max = max
-        self.numerical_max_html_xml = f'{max:.4f}'
 
 
     def finalize(self):
@@ -272,6 +431,18 @@ class Question(object):
                 raise Text2qtiError('Question must specify a correct choice')
             if self.correct_choices > 1:
                 raise Text2qtiError('Question must specify only one correct choice')
+        elif self.type == 'short_answer_question':
+            if not self.choices:
+                raise Text2qtiError('Question must provide at least one answer')
+        elif self.type == 'multiple_answers_question':
+            # There must be at least one choice for the type to be set, so
+            # don't need to check for zero choices
+            if len(self.choices) < 2:
+                raise Text2qtiError('Question must provide more than one choice')
+            if self.correct_choices < 1:
+                raise Text2qtiError('Question must specify a correct choice')
+
+
 
 
 class Group(object):
@@ -285,7 +456,7 @@ class Group(object):
         self.points_per_question = 1
         self._points_per_question_is_set = False
         self.questions: List[Question] = []
-        self._question_points_possible: Optional[int] = None
+        self._question_points_possible: Optional[Union[int, float]] = None
         self.title_raw: Optional[str] = None
         self.title_xml = 'Group'
 
@@ -371,7 +542,7 @@ class Quiz(object):
         self.title_xml = 'Quiz'
         self.description_raw = None
         self.description_html_xml = ''
-        self.questions_and_delims: List[Union[Question, GroupStart, GroupEnd]] = []
+        self.questions_and_delims: List[Union[Question, GroupStart, GroupEnd, TextRegion]] = []
         self._current_group: Optional[Group] = None
         # The set for detecting duplicate questions uses the XML version of
         # the question, to avoid the issue of multiple Markdown
@@ -379,12 +550,15 @@ class Quiz(object):
         self.question_set: Set[str] = set()
         self.md = Markdown(config)
         self.images: Dict[str, Image] = self.md.images
+        self._next_question_attr = {}
 
         parse_actions = {}
         for k in start_patterns:
             parse_actions[k] = getattr(self, f'append_{k}')
         parse_actions[None] = self.append_unknown
-        # Enhancement: revise to allow elements to span multiple paragraphs
+        start_multiline_comment_pattern = comment_patterns['start_multiline_comment']
+        end_multiline_comment_pattern = comment_patterns['end_multiline_comment']
+        line_comment_pattern = comment_patterns['line_comment']
         n_line_iter = iter(x for x in enumerate(string.splitlines()))
         n, line = next(n_line_iter, (0, None))
         lookahead = False
@@ -422,27 +596,53 @@ class Quiz(object):
                         n_line_iter = itertools.chain(code_n_line_iter, n_line_iter)
                         n, line = next(n_line_iter, (0, None))
                         continue
-                elif action not in no_content:
-                    indent_expandtabs = ' '*len(line[:len(line)-len(text)].expandtabs(4))
+                elif action in multi_line:
+                    if start_patterns[action].endswith(':'):
+                        indent_expandtabs = None
+                    else:
+                        indent_expandtabs = ' '*len(line[:match.end()].expandtabs(4))
                     text_lines = [text]
                     n, line = next(n_line_iter, (0, None))
                     line_expandtabs = line.expandtabs(4) if line is not None else None
                     lookahead = True
-                    if action in multi_para:
-                        while (line is not None and
-                                (not line or line.isspace() or line_expandtabs.startswith(indent_expandtabs))):
+                    while (line is not None and
+                            (not line or line.isspace() or
+                                indent_expandtabs is None or line_expandtabs.startswith(indent_expandtabs))):
+                        if not line or line.isspace():
+                            if action in multi_para:
+                                text_lines.append('')
+                            else:
+                                break
+                        else:
+                            if indent_expandtabs is None:
+                                if not line.startswith(' '):
+                                    break
+                                indent_expandtabs = ' '*(len(line_expandtabs)-len(line_expandtabs.lstrip(' ')))
+                                if len(indent_expandtabs) < 2:
+                                    raise Text2qtiError(f'In {self.source_name} on line {n+1}:\nIndentation must be at least 2 spaces or 1 tab here')
+                            # The `rstrip()` prevents trailing double
+                            # spaces from becoming `<br />`.
                             text_lines.append(line_expandtabs[len(indent_expandtabs):].rstrip())
-                            n, line = next(n_line_iter, (0, None))
-                            line_expandtabs = line.expandtabs(4) if line is not None else None
-                        text = '\n'.join(text_lines)
-                    else:
-                        while (line is not None and
-                                line_expandtabs.startswith(indent_expandtabs) and
-                                line_expandtabs[len(indent_expandtabs):len(indent_expandtabs)+1] not in ('', ' ', '\t')):
-                            text_lines.append(line_expandtabs[len(indent_expandtabs):].rstrip())
-                            n, line = next(n_line_iter, (0, None))
-                            line_expandtabs = line.expandtabs(4) if line is not None else None
-                        text = ' '.join(text_lines)
+                        n, line = next(n_line_iter, (0, None))
+                        line_expandtabs = line.expandtabs(4) if line is not None else None
+                    text = '\n'.join(text_lines)
+            elif line.startswith(line_comment_pattern):
+                n, line = next(n_line_iter, (0, None))
+                continue
+            elif line.startswith(start_multiline_comment_pattern):
+                if line.strip() != start_multiline_comment_pattern:
+                    raise Text2qtiError(f'In {self.source_name} on line {n+1}:\nUnexpected content after "{start_multiline_comment_pattern}"')
+                n, line = next(n_line_iter, (0, None))
+                while line is not None and not line.startswith(end_multiline_comment_pattern):
+                    n, line = next(n_line_iter, (0, None))
+                if line is None:
+                    raise Text2qtiError(f'In {self.source_name} on line {n+1}:\nf"{start_multiline_comment_pattern}" without following "{end_multiline_comment_pattern}"')
+                if line.strip() != end_multiline_comment_pattern:
+                    raise Text2qtiError(f'In {self.source_name} on line {n+1}:\nUnexpected content after "{end_multiline_comment_pattern}"')
+                n, line = next(n_line_iter, (0, None))
+                continue
+            elif line.startswith(end_multiline_comment_pattern):
+                raise Text2qtiError(f'In {self.source_name} on line {n+1}:\n"{end_multiline_comment_pattern}" without preceding "{start_multiline_comment_pattern}"')
             else:
                 action = None
                 text = line
@@ -477,6 +677,8 @@ class Quiz(object):
                 digests.append(x.group.hash_digest)
             elif isinstance(x, GroupEnd):
                 pass
+            elif isinstance(x, TextRegion):
+                pass
             else:
                 raise TypeError
         self.points_possible = points_possible
@@ -485,6 +687,8 @@ class Quiz(object):
             h.update(digest)
         self.hash_digest = h.digest()
         self.id = h.hexdigest()[:64]
+
+        self.md.finalize()
 
     def _run_code(self, executable: str, code: str) -> str:
         if not self.config['run_code_blocks']:
@@ -518,6 +722,8 @@ class Quiz(object):
 
 
     def append_quiz_title(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
         if self.title_raw is not None:
             raise Text2qtiError('Quiz title has already been given')
         if self.questions_and_delims:
@@ -528,6 +734,8 @@ class Quiz(object):
         self.title_xml = self.md.xml_escape(text)
 
     def append_quiz_description(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
         if self.description_raw is not None:
             raise Text2qtiError('Quiz description has already been given')
         if self.questions_and_delims:
@@ -535,12 +743,45 @@ class Quiz(object):
         self.description_raw = text
         self.description_html_xml = self.md.md_to_html_xml(text)
 
+    def append_text_title(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
+        if self.questions_and_delims:
+            last_question_or_delim = self.questions_and_delims[-1]
+            if isinstance(last_question_or_delim, Question):
+                last_question_or_delim.finalize()
+        text_region = TextRegion(index=len(self.questions_and_delims), md=self.md)
+        text_region.set_title(text)
+        self.questions_and_delims.append(text_region)
+
+    def append_text(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
+        if self.questions_and_delims:
+            last_question_or_delim = self.questions_and_delims[-1]
+            if isinstance(last_question_or_delim, Question):
+                last_question_or_delim.finalize()
+            if isinstance(last_question_or_delim, TextRegion) and last_question_or_delim.text_raw is None:
+                last_question_or_delim.set_text(text)
+            else:
+                text_region = TextRegion(index=len(self.questions_and_delims), md=self.md)
+                text_region.set_text(text)
+                self.questions_and_delims.append(text_region)
+        else:
+            text_region = TextRegion(index=len(self.questions_and_delims), md=self.md)
+            text_region.set_text(text)
+            self.questions_and_delims.append(text_region)
+
     def append_question(self, text: str):
         if self.questions_and_delims:
             last_question_or_delim = self.questions_and_delims[-1]
             if isinstance(last_question_or_delim, Question):
                 last_question_or_delim.finalize()
-        question = Question(text, md=self.md)
+        question = Question(text,
+                            title=self._next_question_attr.get('title'),
+                            points=self._next_question_attr.get('points'),
+                            md=self.md)
+        self._next_question_attr = {}
         if question.question_html_xml in self.question_set:
             raise Text2qtiError('Duplicate question')
         self.question_set.add(question.question_html_xml)
@@ -548,23 +789,21 @@ class Quiz(object):
         if self._current_group is not None:
             self._current_group.append_question(question)
 
-    def append_correct_choice(self, text: str):
-        if not self.questions_and_delims:
-            raise Text2qtiError('Cannot have a choice without a question')
-        last_question_or_delim = self.questions_and_delims[-1]
-        if not isinstance(last_question_or_delim, Question):
-            raise Text2qtiError('Cannot have a choice without a question')
-        last_question_or_delim.append_correct_choice(text)
+    def append_question_title(self, text: str):
+        if 'title' in self._next_question_attr:
+            raise Text2qtiError('Title for next question has already been set')
+        if 'points' in self._next_question_attr:
+            raise Text2qtiError('Title for next question must be set before point value')
+        self._next_question_attr['title'] = text
 
-    def append_incorrect_choice(self, text: str):
-        if not self.questions_and_delims:
-            raise Text2qtiError('Cannot have a choice without a question')
-        last_question_or_delim = self.questions_and_delims[-1]
-        if not isinstance(last_question_or_delim, Question):
-            raise Text2qtiError('Cannot have a choice without a question')
-        last_question_or_delim.append_incorrect_choice(text)
+    def append_question_points(self, text: str):
+        if 'points' in self._next_question_attr:
+            raise Text2qtiError('Points for next question has already been set')
+        self._next_question_attr['points'] = text
 
     def append_feedback(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
         if not self.questions_and_delims:
             raise Text2qtiError('Cannot have feedback without a question')
         last_question_or_delim = self.questions_and_delims[-1]
@@ -573,6 +812,8 @@ class Quiz(object):
         last_question_or_delim.append_feedback(text)
 
     def append_correct_feedback(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
         if not self.questions_and_delims:
             raise Text2qtiError('Cannot have feedback without a question')
         last_question_or_delim = self.questions_and_delims[-1]
@@ -581,6 +822,8 @@ class Quiz(object):
         last_question_or_delim.append_correct_feedback(text)
 
     def append_incorrect_feedback(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
         if not self.questions_and_delims:
             raise Text2qtiError('Cannot have feedback without a question')
         last_question_or_delim = self.questions_and_delims[-1]
@@ -588,7 +831,59 @@ class Quiz(object):
             raise Text2qtiError('Cannot have feedback without a question')
         last_question_or_delim.append_incorrect_feedback(text)
 
+    def append_mctf_correct_choice(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
+        if not self.questions_and_delims:
+            raise Text2qtiError('Cannot have a choice without a question')
+        last_question_or_delim = self.questions_and_delims[-1]
+        if not isinstance(last_question_or_delim, Question):
+            raise Text2qtiError('Cannot have a choice without a question')
+        last_question_or_delim.append_mctf_correct_choice(text)
+
+    def append_mctf_incorrect_choice(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
+        if not self.questions_and_delims:
+            raise Text2qtiError('Cannot have a choice without a question')
+        last_question_or_delim = self.questions_and_delims[-1]
+        if not isinstance(last_question_or_delim, Question):
+            raise Text2qtiError('Cannot have a choice without a question')
+        last_question_or_delim.append_mctf_incorrect_choice(text)
+
+    def append_shortans_correct_choice(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
+        if not self.questions_and_delims:
+            raise Text2qtiError('Cannot have an answer without a question')
+        last_question_or_delim = self.questions_and_delims[-1]
+        if not isinstance(last_question_or_delim, Question):
+            raise Text2qtiError('Cannot have an answer without a question')
+        last_question_or_delim.append_shortans_correct_choice(text)
+
+    def append_multans_correct_choice(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
+        if not self.questions_and_delims:
+            raise Text2qtiError('Cannot have a choice without a question')
+        last_question_or_delim = self.questions_and_delims[-1]
+        if not isinstance(last_question_or_delim, Question):
+            raise Text2qtiError('Cannot have a choice without a question')
+        last_question_or_delim.append_multans_correct_choice(text)
+
+    def append_multans_incorrect_choice(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
+        if not self.questions_and_delims:
+            raise Text2qtiError('Cannot have a choice without a question')
+        last_question_or_delim = self.questions_and_delims[-1]
+        if not isinstance(last_question_or_delim, Question):
+            raise Text2qtiError('Cannot have a choice without a question')
+        last_question_or_delim.append_multans_incorrect_choice(text)
+
     def append_essay(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
         if not self.questions_and_delims:
             raise Text2qtiError('Cannot have an essay response without a question')
         last_question_or_delim = self.questions_and_delims[-1]
@@ -596,7 +891,19 @@ class Quiz(object):
             raise Text2qtiError('Cannot have an essay response without a question')
         last_question_or_delim.append_essay(text)
 
+    def append_upload(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
+        if not self.questions_and_delims:
+            raise Text2qtiError('Cannot have an upload response without a question')
+        last_question_or_delim = self.questions_and_delims[-1]
+        if not isinstance(last_question_or_delim, Question):
+            raise Text2qtiError('Cannot have an upload response without a question')
+        last_question_or_delim.append_upload(text)
+
     def append_numerical(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
         if not self.questions_and_delims:
             raise Text2qtiError('Cannot have a numerical response without a question')
         last_question_or_delim = self.questions_and_delims[-1]
@@ -605,6 +912,8 @@ class Quiz(object):
         last_question_or_delim.append_numerical(text)
 
     def append_start_group(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
         if text:
             raise ValueError
         if self._current_group is not None:
@@ -618,6 +927,8 @@ class Quiz(object):
         self.questions_and_delims.append(GroupStart(group))
 
     def append_end_group(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
         if text:
             raise ValueError
         if self._current_group is None:
@@ -631,11 +942,15 @@ class Quiz(object):
         self._current_group = None
 
     def append_group_pick(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
         if self._current_group is None:
             raise Text2qtiError('No question group for setting properties')
         self._current_group.append_group_pick(text)
 
     def append_group_points_per_question(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
         if self._current_group is None:
             raise Text2qtiError('No question group for setting properties')
         self._current_group.append_group_points_per_question(text)
@@ -647,6 +962,8 @@ class Quiz(object):
         raise Text2qtiError('Code block end missing code block start')
 
     def append_unknown(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
         if text and not text.isspace():
             match = start_missing_whitespace_re.match(text)
             if match:

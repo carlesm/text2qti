@@ -2,10 +2,11 @@
 
 text2qti converts
 [Markdown](https://daringfireball.net/projects/markdown/)-based plain text
-files into quizzes in QTI format, which can be imported by
+files into quizzes in QTI format (version 1.2), which can be imported by
 [Canvas](https://www.instructure.com/canvas/) and other educational software.
-It supports multiple-choice, true/false, numerical, and essay questions.
-It includes basic support for LaTeX math within Markdown, and allows a limited
+It supports multiple-choice, true/false, multiple-answers, numerical,
+short-answer (fill-in-the-blank), essay, and file-upload questions.  It
+includes basic support for LaTeX math within Markdown, and allows a limited
 subset of [siunitx](https://ctan.org/pkg/siunitx) notation for units and for
 numbers in scientific notation.
 
@@ -13,8 +14,9 @@ numbers in scientific notation.
 
 ## Examples
 
-text2qti allows quick and efficient quiz creation.  Example plain-text quiz
-question that can be converted to QTI and then imported by Canvas:
+text2qti allows quick and efficient quiz creation.  Example
+**multiple-choice** plain-text quiz question that can be converted to QTI and
+then imported by Canvas:
 
 ```
 1.  What is 2+3?
@@ -31,14 +33,19 @@ be ordered or unique.  The **correct** choice is designated with an asterisk
 ("`*c) `").  All question and choice text is processed as
 [Markdown](https://daringfireball.net/projects/markdown/).
 
-There is also support for a quiz title, a quiz description, and feedback.
-Note that unlike all other text, the title is treated as plain text, not
-Markdown, due to the QTI format.
+There is also support for a quiz title and description, as well as question
+titles, point values, and feedback.  Note that unlike all other text, titles
+like quiz and question titles are treated as plain text, not Markdown, due to
+the QTI format.  Also note that Canvas may ignore the quiz description and
+question titles.  Question point values must be positive integers or
+half-integers.
 
 ```
 Quiz title: Addition
 Quiz description: Checking addition.
 
+Title: An addition question
+Points: 2
 1.  What is 2+3?
 ... General question feedback.
 +   Feedback for correct answer.
@@ -51,7 +58,18 @@ b)  1
 ... Feedback for this particular answer.
 ```
 
-**Numerical questions** are indicated by an equals sign followed by one or
+**Multiple-answers questions** use `[]` or `[ ]` for incorrect answers and
+`[*]` for correct answers.
+
+```
+1.  Which of the following are dinosaurs?
+[ ] Woolly mammoth
+[*] Tyrannosaurus rex
+[*] Triceratops
+[ ] Smilodon fatalis
+```
+
+**Numerical questions** use an equals sign followed by one or
 more spaces or tabs followed by the numerical answer.  Acceptable answers can
 be designated as a range of the form `[<min>, <max>]` or as a correct answer
 with a specified acceptable margin of error `<ans> +- <margin>`.  When the
@@ -76,15 +94,45 @@ must be greater than or equal to 0.0001 (1e-4).
 =   5
 ```
 
+**Short-answer (fill-in-the-blank) questions** use an asterisk followed by one
+or more spaces or tabs followed by an answer.  Multiple acceptable answers can
+be given.  Answers are restricted to a single line each.
+```
+1.  Who lives at the North Pole?
+*   Santa
+*   Santa Claus
+*   Father Christmas
+*   Saint Nicholas
+*   Saint Nick
+```
 
 **Essay questions** are indicated by a sequence of three or more underscores.
-They do not support feedback.
+They only support general question feedback.
 
 ```
 1.  Write an essay.
+... General question feedback.
 ____
-````
+```
 
+**File-upload questions** are indicated by a sequence of three or more
+circumflex accents.  They only support general question feedback.
+```
+1.  Upload a file.
+... General question feedback.
+^^^^
+```
+
+**Text regions** outside of questions are supported.  Note that unlike all
+other text, titles like text region titles are treated as plain text, not
+Markdown, due to the QTI format.  Also note that Canvas may ignore the text
+region title and only display the text itself.  Text regions are not required
+to have both a title and text; either may be used alone, but the title must come
+first when both are present.
+```
+Text title:  Instructions about the next questions
+Text:  General comments about the next questions.
+```
 
 
 ## Installation
@@ -208,9 +256,11 @@ needed if you plan to use LaTeX math; if not, simply press ENTER to continue.
    then export the quiz to QTI and look through the resulting output to find
    the URL.
  * If you are using educational software that does not handle LaTeX in a
-   manner compatible with Canvas, please open an issue requesting support for
-   that software, and include as much information as possible about how that
-   software processes LaTeX.
+   manner compatible with Canvas, try the `--pandoc-mathml` command-line
+   option when creating QTI files (note that this requires that
+   [Pandoc](https://pandoc.org/) be installed).  If that does not work, please
+   open an issue requesting support for that software, and include as much
+   information as possible about how that software processes LaTeX.
 
 
 
@@ -297,31 +347,36 @@ versus `Answer`).
 
 text2qti processes almost all text as
 [Markdown](https://daringfireball.net/projects/markdown/), using
-[Python-Markdown](https://python-markdown.github.io/).  (The only exception is
-the quiz title, which is processed as plain text due to the QTI format.)  For
-example, `*emphasized*` produces emphasized text, which typically appears as
-italics.  Text can be styled using Markdown notation, or with HTML.  Remember
-to preview quizzes after conversion to QTI, especially when using any
-significant amount of HTML.
+[Python-Markdown](https://python-markdown.github.io/).  (The only exceptions
+are the quiz title, question titles, and text region titles, which are
+processed as plain text due to the QTI format.)  For example, `*emphasized*`
+produces *emphasized* text, which typically appears as italics.  Text can be
+styled using Markdown notation, or with HTML.  Remember to preview quizzes
+after conversion to QTI, especially when using any significant amount of HTML.
 
 
 ### Titles
 
-Titles are limited to a single paragraph.  If this paragraph is wrapped over
-multiple lines, all lines after the first must be indented to the same level
-as the start of the paragraph text on the initial line.  All tabs are expanded
-to 4 spaces before indentation is compared, following the typical Markdown
-approach.
+Quiz, question, and text region titles are limited to a single paragraph.  If
+this paragraph is wrapped over multiple lines, all lines after the first must
+be indented by at least two spaces or one tab, and share the same indentation.
+All tabs are expanded to 4 spaces before indentation is compared, following
+the typical Markdown approach.
+
+All titles are treated as plain text, not Markdown, due to the QTI format.
+
+Titles are always optional, but when they are used for a given element, they
+are always required to be first, before any other attributes.
 
 
-### Descriptions, questions, choices, and feedback
+### Descriptions, questions, choices, feedback, and text regions
 
-Descriptions, questions, choices, and feedback may span multiple paragraphs
-and include arbitrary Markdown content like code blocks or quotations.
-Everything must be indented to at least the same level as the start of the
-first paragraph on the initial line.  All tabs are expanded to 4 spaces before
-indentation is compared, following the typical Markdown approach.  For
-example,
+Descriptions, questions, choices, feedback, and text regions may span multiple
+paragraphs and include arbitrary Markdown content like code blocks or
+quotations.  Everything must be indented to at least the same level as the
+start of the first paragraph on the initial line.  All tabs are expanded to 4
+spaces before indentation is compared, following the typical Markdown
+approach.  For example,
 ```
 1.  A question paragraph that is long enough to wrap onto a second line.
     The second line must be indented to match up with the start of the
@@ -346,6 +401,19 @@ result in errors if these files are not found.
 
 
 ### LaTeX
+
+By default, text2qti supports LaTeX using a Canvas LaTeX rendering URL.  This
+can be set during installation, or by editing the configuration file
+`.text2qti.bespon` in your home or user directory.  It is possible to convert
+LaTeX to MathML instead with the `--pandoc-mathml` command-line option.  This
+requires that [Pandoc](https://pandoc.org/) be installed for converting LaTeX
+to MathML.  For example, to create a quiz you might run a command like this:
+```
+text2qti --pandoc-mathml quiz.txt
+```
+When `--pandoc-mathml` is used, a cache file `_text2qti_cache.zip` will be
+created in the quiz file directory.  This is used to store Pandoc MathML
+output to increase performance for long quizzes with lots of math.
 
 text2qti supports inline LaTeX math within dollar signs `$`.  There must be a
 non-space character immediately after the opening `$` and immediately before
@@ -375,3 +443,27 @@ Technical note: LaTeX and siunitx support are currently implemented as
 preprocessors that are used separately from Python-Markdown.  In rare cases,
 this may lead to conflicts with Markdown syntax.  These features may be
 reimplemented as Python-Markdown extensions in the future.
+
+
+### Comments
+
+There are multiple ways to add comments within a quiz file.  In all cases,
+comments are completely removed during quiz creation and do not appear in the
+final quiz in any form.
+
+At the top level of a quiz document (outside of questions, choices, or
+feedback) there are two types of comments.  These comments cannot be indented.
+* Line comments:  Any line that starts with a percent sign `%` is discarded.
+* Multiline comments:  If a line starts with `COMMENT`, that line and all
+  subsequent lines are discarded through a line that starts with
+  `END_COMMENT`.  The `COMMENT` and `END_COMMENT` delimiters must be on lines
+  by themselves; otherwise, an error is raised.
+
+Within Markdown text, standard HTML comments of the form `<!--comment-->` may
+be used.  These are stripped out during processing and do not appear in the
+final QTI file.  HTML comments are not supported within LaTeX math.
+
+Technical note:  HTML comments are currently stripped in a preprocessing step
+separate from Python-Markdown.  In rare cases, this may conflict with raw HTML
+embedded in Markdown.  This feature may be reimplemented as a Python-Markdown
+extension in the future.
