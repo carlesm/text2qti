@@ -1,10 +1,21 @@
 # Change Log
 
 
-## v0.3.0 (2020-??-??)
+## v0.4.0 (dev)
+
+* Improved preprocessing for siunitx notation, LaTeX math, and HTML comments.
+  Fixed catastrophic backtracking in LaTeX math regex (#11).  Added support
+  for newlines in HTML comments.  The preprocessor now skips backslash
+  escapes, inline code containing newlines, and fenced code blocks (as long as
+  they do not start on the same line as a list marker).
+* Python-Markdown's Markdown-in-HTML extension is now enabled (#13).
+
+
+
+## v0.3.0 (2020-05-26)
 
 * Added support for multiple-answers questions.
-* Added support for short-answer questions.
+* Added support for short-answer (fill-in-the-blank) questions.
 * Added support for file-upload questions.
 * Added support for setting question titles and point values (#9).
 * Added support for text regions outside questions.
